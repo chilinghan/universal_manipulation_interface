@@ -21,12 +21,9 @@ from tqdm import tqdm
 from collections import defaultdict
 from umi.common.cv_util import (
     parse_fisheye_intrinsics,
-    FisheyeRectConverter,
-    get_image_transform, 
-    draw_predefined_mask,
-    inpaint_tag,
-    get_mirror_crop_slices
+    FisheyeRectConverter
 )
+from umi.common.video_preprocess import make_umi_image_processor
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs, JpegXl
 register_codecs()
@@ -169,9 +166,12 @@ def main(input, output, out_res, out_fov, compression_level,
     def video_to_zarr(replay_buffer, mp4_path, tasks):
         pkl_path = os.path.join(os.path.dirname(mp4_path), 'tag_detection.pkl')
         tag_detection_results = pickle.load(open(pkl_path, 'rb'))
-        resize_tf = get_image_transform(
+        processor = make_umi_image_processor(
             in_res=(iw, ih),
-            out_res=out_res
+            out_res=out_res,
+            no_mirror=no_mirror,
+            mirror_swap=mirror_swap,
+            fisheye_converter=fisheye_converter,
         )
         tasks = sorted(tasks, key=lambda x: x['frame_start'])
         camera_idx = None
@@ -184,14 +184,6 @@ def main(input, output, out_res, out_fov, compression_level,
         img_array = replay_buffer.data[name]
         
         curr_task_idx = 0
-        
-        is_mirror = None
-        if mirror_swap:
-            ow, oh = out_res
-            mirror_mask = np.ones((oh,ow,3),dtype=np.uint8)
-            mirror_mask = draw_predefined_mask(
-                mirror_mask, color=(0,0,0), mirror=True, gripper=False, finger=False)
-            is_mirror = (mirror_mask[...,0] == 0)
         
         with av.open(mp4_path) as container:
             in_stream = container.streams.video[0]
@@ -212,28 +204,8 @@ def main(input, output, out_res, out_fov, compression_level,
                     
                     # do current task
                     img = frame.to_ndarray(format='rgb24')
-
-                    # inpaint tags
                     this_det = tag_detection_results[frame_idx]
-                    all_corners = [x['corners'] for x in this_det['tag_dict'].values()]
-                    for corners in all_corners:
-                        img = inpaint_tag(img, corners)
-                        
-                    # mask out gripper
-                    img = draw_predefined_mask(img, color=(0,0,0), 
-                        mirror=no_mirror, gripper=True, finger=False)
-                    # resize
-                    if fisheye_converter is None:
-                        img = resize_tf(img)
-                    else:
-                        img = fisheye_converter.forward(img)
-                        
-                    # handle mirror swap
-                    if mirror_swap:
-                        img[is_mirror] = img[:,::-1,:][is_mirror]
-                        
-                    # compress image
-                    img_array[buffer_idx] = img
+                    img_array[buffer_idx] = processor(img, this_det)
                     buffer_idx += 1
                     
                     if (frame_idx + 1) == tasks[curr_task_idx]['frame_end']:

@@ -539,16 +539,16 @@ def main(input, output, tcp_offset, tx_slam_tag,
         align_cam_idx = np.argmin([sum(x) for x in alignment_costs])
 
         # mock experiment
-        # alignment_costs = list()
-        # starts = [0.2, 0.1, 0.0]
-        # for i in range(len(starts)):
-        #     this_alignment_cost = list()
-        #     for j in range(len(starts)):
-        #         this_alignment_cost.append((starts[j] - starts[i]) % 0.5)
-        #     alignment_costs.append(this_alignment_cost)
+        alignment_costs = list()
+        starts = [0.2, 0.1, 0.0]
+        for i in range(len(starts)):
+            this_alignment_cost = list()
+            for j in range(len(starts)):
+                this_alignment_cost.append((starts[j] - starts[i]) % 0.5)
+            alignment_costs.append(this_alignment_cost)
 
-        # align_video_idx = np.argmin([sum(x) for x in alignment_costs])
-        # print(align_video_idx)
+        align_video_idx = np.argmin([sum(x) for x in alignment_costs])
+        print(f"Aligned video index of demo {demo_idx}:", align_video_idx)
 
         # rewrite start_timestamp to be integer multiple of dt
         align_video_start = demo_video_meta_df.loc[align_cam_idx]['start_timestamp']
@@ -703,6 +703,8 @@ def main(input, output, tcp_offset, tx_slam_tag,
         # aggregate valid result
         all_is_valid = np.array(all_is_valid)
         is_step_valid = np.all(all_is_valid, axis=0)
+        print(f"Demo {demo_idx} valid frames before filtering: {is_step_valid.sum()} / {len(is_step_valid)}")
+
         
         # generate episode start and end pose for each gripper
         first_valid_step = np.nonzero(is_step_valid)[0][0]
