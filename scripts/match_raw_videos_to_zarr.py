@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Match raw videos to processed zarr episodes and save matched paths into metadata.
+"""Match raw videos to processed zarr episodes and write alignment metadata.
 
-Workflow:
-1) Compare frame counts: zarr episode lengths vs raw videos.
-2) Apply the same UMI image processing to anchor raw-video frames.
-3) For each zarr episode/camera, match candidates with same frame count.
-4) Resolve ambiguity with first/mid/last-frame MSE.
-5) Drop episodes with missing/low-confidence matches.
-6) Save matched paths + MSE to zarr meta.
+Pipeline intent:
+1) Reproduce dataset-plan camera alignment windows from raw videos.
+2) For each zarr episode/camera, search start offsets inside each raw window.
+3) Pick the candidate with lowest mean MSE on anchor frames.
+4) Keep only fully matched episodes and save matched path/start/n_frames per camera.
 """
 
 import sys
@@ -19,21 +17,22 @@ os.chdir(ROOT_DIR)
 
 import json
 import pathlib
-import pickle
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List
 
 import av
 import click
 import numpy as np
 import zarr
+from tqdm import tqdm
 
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs
-from umi.common.video_preprocess import make_umi_image_processor
+from umi.common.cv_util import make_umi_image_processor
+from umi.common.raw_video_util import collect_alignment_windows, count_video_frames, normalize_video_path, resolve_video_paths
 
 register_codecs()
-
+av.logging.set_level(av.logging.ERROR)
 
 @dataclass
 class RawVideoInfo:
@@ -41,7 +40,8 @@ class RawVideoInfo:
     n_frames: int
     width: int
     height: int
-    first_frame_processed: Optional[np.ndarray] = None
+    # window_start_frame: int
+    # window_n_frames: int
 
 
 def _open_replay_buffer(zarr_path: pathlib.Path, mode: str):
@@ -53,30 +53,40 @@ def _open_replay_buffer(zarr_path: pathlib.Path, mode: str):
     return None, ReplayBuffer.create_from_group(root)
 
 
-def _count_video_frames(path: str) -> Tuple[int, int, int]:
-    with av.open(path) as container:
-        stream = container.streams.video[0]
-        width = int(stream.width)
-        height = int(stream.height)
-        n_frames = int(stream.frames or 0)
-        if n_frames > 0:
-            return n_frames, width, height
-
-        n = 0
-        for _ in container.decode(stream):
-            n += 1
-        return n, width, height
-
-
-def _read_frame_rgb_at(path: str, frame_idx: int) -> np.ndarray:
+def _read_preprocessed_frame(info: RawVideoInfo, frame_idx: int, processor) -> np.ndarray:
     if frame_idx < 0:
         raise ValueError(f"frame_idx must be >= 0, got {frame_idx}")
-    with av.open(path) as container:
+    with av.open(info.path) as container:
         stream = container.streams.video[0]
         for i, frame in enumerate(container.decode(stream)):
             if i == frame_idx:
-                return frame.to_ndarray(format="rgb24")
-    raise RuntimeError(f"No frame {frame_idx} decoded from {path}")
+                return processor(frame.to_ndarray(format="rgb24"), None)
+    raise RuntimeError(f"No frame {frame_idx} decoded from {info.path}")
+
+
+def _read_preprocessed_frame_with_seek(info: RawVideoInfo, frame_idx: int, processor) -> np.ndarray:
+    with av.open(info.path) as container:
+        stream = container.streams.video[0]
+
+        fps = float(stream.average_rate)
+        time_base = float(stream.time_base)
+
+        target_pts = int((frame_idx / fps) / time_base)
+        container.seek(max(target_pts, 0), stream=stream, backward=True)
+
+        for frame in container.decode(stream):
+            if frame.pts is None:
+                continue
+
+            decoded_idx = int(round(float(frame.pts) * time_base * fps))
+            if decoded_idx == frame_idx:
+                rgb = frame.to_ndarray(format="rgb24")
+                return processor(rgb, None)
+
+            if decoded_idx > frame_idx:
+                break
+
+    raise RuntimeError(f"Frame {frame_idx} not found in {info.path}")
 
 
 def _infer_camera_indices(rb: ReplayBuffer) -> List[int]:
@@ -94,17 +104,12 @@ def _episode_lengths(episode_ends: np.ndarray) -> np.ndarray:
     return episode_ends - starts
 
 
-def _as_unicode_array(values: Sequence[str]) -> np.ndarray:
+def _as_unicode_array(values: List[str]) -> np.ndarray:
     maxlen = max([len(v) for v in values], default=1)
     return np.asarray(values, dtype=f"<U{maxlen}")
 
 
-def _copy_filtered_episodes(
-    src_rb: ReplayBuffer,
-    keep_episode_indices: List[int],
-    out_path: pathlib.Path,
-    extra_meta: Dict[str, np.ndarray],
-):
+def _copy_filtered_episodes(src_rb: ReplayBuffer, keep_episode_indices: List[int], out_path: pathlib.Path, extra_meta: Dict[str, np.ndarray]):
     src_data_arrays = {k: src_rb.data[k] for k in src_rb.data.keys()}
     chunks = {k: src_data_arrays[k].chunks for k in src_data_arrays.keys()}
     compressors = {k: src_data_arrays[k].compressor for k in src_data_arrays.keys()}
@@ -157,7 +162,7 @@ def _copy_filtered_episodes(
 @click.option("--video-glob", default="**/*.mp4", show_default=True, type=str)
 @click.option("--no-mirror", is_flag=True, default=False)
 @click.option("--mirror-swap", is_flag=True, default=False)
-@click.option("--debug-dir", default=None, type=str, help="Optional directory to write debug matched frames")
+@click.option("--debug-dir", default=None, type=str, help="Optional directory to write jsonl debug rows")
 def main(
     zarr_path: str,
     raw_video_dir: str,
@@ -165,7 +170,7 @@ def main(
     video_glob: str,
     no_mirror: bool,
     mirror_swap: bool,
-    debug_dir: Optional[str],
+    debug_dir,
 ):
     zarr_path = pathlib.Path(os.path.expanduser(zarr_path)).absolute()
     raw_video_dir = pathlib.Path(os.path.expanduser(raw_video_dir)).absolute()
@@ -174,6 +179,9 @@ def main(
     if debug_dir:
         debug_dir_path = pathlib.Path(os.path.expanduser(debug_dir)).absolute()
         debug_dir_path.mkdir(parents=True, exist_ok=True)
+        debug_file = debug_dir_path / "match_debug.jsonl"
+        if debug_file.exists():
+            debug_file.unlink()
 
     store, rb = _open_replay_buffer(zarr_path, mode="r")
     try:
@@ -184,128 +192,137 @@ def main(
         episode_ends = rb.episode_ends[:]
         ep_lengths = _episode_lengths(episode_ends)
         n_episodes = len(ep_lengths)
-
         zarr_starts = np.concatenate([[0], episode_ends[:-1]])
 
         print(f"Found {n_episodes} episodes in zarr")
         print(f"Cameras in zarr: {camera_indices}")
 
-        raw_paths = sorted(raw_video_dir.glob(video_glob))
-        raw_paths = [p for p in raw_paths if p.is_file() and p.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi"}]
-        if not raw_paths:
-            raise click.ClickException(f"No videos found under {raw_video_dir} matching {video_glob}")
+        try:
+            raw_paths, _ = resolve_video_paths(raw_video_dir, glob_pattern=video_glob)
+        except FileNotFoundError as exc:
+            raise click.ClickException(str(exc))
+        print(f"Resolved {len(raw_paths)} videos from {raw_video_dir}")
+
+        # frame_windows = collect_alignment_windows(raw_paths, glob_pattern=video_glob)
+        # if frame_windows:
+        #     print(
+        #         "Using dataset-plan style alignment windows "
+        #         f"(includes end-frame -1 behavior) for {len(frame_windows)} videos"
+        #     )
+        # else:
+        #     print("No alignment windows resolved; falling back to full video ranges")
+        print("Alignment windows disabled; using full video ranges")
 
         raw_infos: List[RawVideoInfo] = []
         for p in raw_paths:
-            n_frames, w, h = _count_video_frames(str(p))
-            raw_infos.append(RawVideoInfo(path=str(p), n_frames=n_frames, width=w, height=h))
-
-        frame_count_hist: Dict[int, int] = {}
-        for r in raw_infos:
-            frame_count_hist[r.n_frames] = frame_count_hist.get(r.n_frames, 0) + 1
-
-        print(f"Indexed {len(raw_infos)} raw videos")
-        print(f"Unique raw frame counts: {len(frame_count_hist)}")
-
-        processors: Dict[Tuple[int, int, int, int], callable] = {}
-        processed_frame_cache: Dict[Tuple[str, int, int, int], np.ndarray] = {}
-
-        def preprocess_frame_at(info: RawVideoInfo, out_w: int, out_h: int, frame_idx: int) -> np.ndarray:
-            cache_key = (info.path, out_w, out_h, frame_idx)
-            if cache_key in processed_frame_cache:
-                return processed_frame_cache[cache_key]
-
-            key = (info.width, info.height, out_w, out_h)
-            if key not in processors:
-                processors[key] = make_umi_image_processor(
-                    in_res=(info.width, info.height),
-                    out_res=(out_w, out_h),
-                    no_mirror=no_mirror,
-                    mirror_swap=mirror_swap,
-                    fisheye_converter=None,
+            n_frames, width, height = count_video_frames(str(p))
+            # window_start, window_n_frames = frame_windows.get(p, (0, n_frames))
+            raw_infos.append(
+                RawVideoInfo(
+                    path=normalize_video_path(p),
+                    n_frames=int(n_frames),
+                    width=int(width),
+                    height=int(height),
+                    # window_start_frame=int(window_start),
+                    # window_n_frames=n_frames,
                 )
-            rgb = _read_frame_rgb_at(info.path, frame_idx=frame_idx)
-            
-            out = processors[key](rgb, None) # don't inpaint tag
-            processed_frame_cache[cache_key] = out
-            return out
+            )
+
+        by_window_frame_count: Dict[int, List[RawVideoInfo]] = {}
+        for info in raw_infos:
+            by_window_frame_count.setdefault(info.n_frames, []).append(info)
+
+        processors = {}
 
         keep_eps: List[int] = []
         dropped_eps: List[int] = []
         matched_paths_by_cam: Dict[int, List[str]] = {c: [] for c in camera_indices}
         matched_mse_by_cam: Dict[int, List[float]] = {c: [] for c in camera_indices}
+        matched_start_by_cam: Dict[int, List[int]] = {c: [] for c in camera_indices}
 
-        by_frame_count: Dict[int, List[RawVideoInfo]] = {}
-        for info in raw_infos:
-            by_frame_count.setdefault(info.n_frames, []).append(info)
-
-        print(f"Frame count distribution: {sorted(list(by_frame_count.keys()))}")
-        print(f"Zarr episode lengths: {sorted(set(ep_lengths))}")
-        for ep_idx in range(n_episodes):
+        print(f"Window frame counts: {list(by_window_frame_count.keys())}")
+        for ep_idx in tqdm(range(n_episodes), desc="Matching episodes"):
             length = int(ep_lengths[ep_idx])
             start_idx = int(zarr_starts[ep_idx])
-            
-            candidates = by_frame_count.get(length, [])
-            if not candidates:
-                dropped_eps.append(ep_idx)
-                continue
 
             assigned = {}
             used_paths = set()
             failed = False
 
-            print(f"Processing Zarr episode {ep_idx} with length {length}, candidates: {len(candidates)}")
+            print(f"Matching episode {ep_idx}/{n_episodes - 1} (length={length})")
+            candidate_lengths = range(length + 1, length + 5)
+            candidates = []
+            for candidate_length in candidate_lengths:
+                candidates.extend(by_window_frame_count.get(candidate_length, []))
+            print(f"Found {len(candidates)} candidate videos with matching window frame count")
+            if not candidates:
+                dropped_eps.append(ep_idx)
+                continue
+
             for cam_idx in camera_indices:
                 key = f"camera{cam_idx}_rgb"
-                anchor_offsets = sorted(set([0, max(length - 1, 0)]))
-                zimgs = {ao: rb.data[key][start_idx + ao] for ao in anchor_offsets}
-                zimg0 = zimgs[anchor_offsets[0]]
-                out_h, out_w = int(zimg0.shape[0]), int(zimg0.shape[1])
+                zimg = rb.data[key][start_idx + max(length - 1, 0)]
+                out_h, out_w = int(zimg.shape[0]), int(zimg.shape[1])
 
                 scored = []
                 for c in candidates:
                     if c.path in used_paths:
                         continue
-                    if c.n_frames <= anchor_offsets[-1]:
+                    end_frame_idx = c.n_frames - 1
+                    best_start_frame = end_frame_idx - length + 1
+                    if best_start_frame < 0:
                         continue
-                    mses = []
-                    ok = True
-                    for ao in anchor_offsets:
-                        try:
-                            proc = preprocess_frame_at(c, out_w=out_w, out_h=out_h, frame_idx=ao)
-                        except Exception as e:
-                            ok = False
-                            break
-                        zimg = zimgs[ao]
-                        mse = float(np.mean((proc.astype(np.float32) - zimg.astype(np.float32)) ** 2))
-                        mses.append(mse)
-                    if not ok or len(mses) == 0:
+                    proc_key = (c.width, c.height, out_w, out_h)
+                    if proc_key not in processors:
+                        processors[proc_key] = make_umi_image_processor(
+                            in_res=(c.width, c.height),
+                            out_res=(out_w, out_h),
+                            no_mirror=no_mirror,
+                            mirror_swap=mirror_swap,
+                            fisheye_converter=None,
+                        )
+
+                    try:
+                        proc = _read_preprocessed_frame_with_seek(
+                            info=c,
+                            frame_idx=end_frame_idx,
+                            processor=processors[proc_key],
+                        )
+                    except Exception:
                         continue
-                    mean_mse = float(np.mean(mses))
-                    scored.append((mean_mse, c.path))
+
+                    mse = float(np.mean((proc.astype(np.float32) - zimg.astype(np.float32)) ** 2))
+                    scored.append((mse, c.path, best_start_frame, end_frame_idx))
 
                 if not scored:
                     failed = True
                     break
 
                 scored.sort(key=lambda x: x[0])
-                best_mse, best_path = scored[0]
-                second_mse, second_path = (scored[1] if len(scored) > 1 else (None, None))
-                if debug_dir_path is not None:
-                    with debug_dir_path.joinpath("match_debug.json").open("a") as f:
-                        json.dump({
-                            "episode_index": ep_idx,
-                            "camera_index": cam_idx,
-                            "zarr_length": length,
-                            "best_path": best_path,
-                            "best_mse": best_mse,
-                            "best_length": next((c.n_frames for c in candidates if c.path == best_path), None),
-                            "second_path": second_path,
-                            "second_mse": second_mse,
-                            "second_length": next((c.n_frames for c in candidates if c.path == second_path), None) if second_path else None,
-                        }, f, indent=2)
+                best_mse, best_path, best_start_frame, best_end_frame = scored[0]
+                second = scored[1] if len(scored) > 1 else None
 
-                assigned[cam_idx] = (best_path, best_mse)
+                if debug_dir_path is not None:
+                    with debug_file.open("a") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "episode_index": ep_idx,
+                                    "camera_index": cam_idx,
+                                    "zarr_length": length,
+                                    "best_path": best_path,
+                                    "best_mse": best_mse,
+                                    "best_start_frame": best_start_frame,
+                                    "best_end_frame": best_end_frame,
+                                    "second_path": second[1] if second else None,
+                                    "second_mse": second[0] if second else None,
+                                }
+                            )
+                            + "\n"
+                        )
+
+
+                assigned[cam_idx] = (best_path, best_mse, best_start_frame)
                 used_paths.add(best_path)
 
             if failed:
@@ -314,24 +331,27 @@ def main(
 
             keep_eps.append(ep_idx)
             for cam_idx in camera_indices:
-                p, mse = assigned[cam_idx]
+                p, mse, start_frame = assigned[cam_idx]
                 matched_paths_by_cam[cam_idx].append(p)
                 matched_mse_by_cam[cam_idx].append(mse)
+                matched_start_by_cam[cam_idx].append(start_frame)
 
         print(f"Matched episodes: {len(keep_eps)} / {n_episodes}")
         print(f"Dropped episodes: {len(dropped_eps)}")
 
-        extra_meta = {
+        extra_meta: Dict[str, np.ndarray] = {
             "num_source_episodes_total": np.asarray(n_episodes, dtype=np.int64),
             "num_source_episodes_kept": np.asarray(len(keep_eps), dtype=np.int64),
             "num_source_episodes_dropped": np.asarray(len(dropped_eps), dtype=np.int64),
         }
-        if len(keep_eps) > 0:
+        if keep_eps:
             extra_meta["source_episode_idx"] = np.asarray(keep_eps, dtype=np.int64)
+
         for cam_idx in camera_indices:
-            if len(matched_paths_by_cam[cam_idx]) > 0:
+            if matched_paths_by_cam[cam_idx]:
                 extra_meta[f"matched_raw_video_paths_camera{cam_idx}"] = _as_unicode_array(matched_paths_by_cam[cam_idx])
                 extra_meta[f"matched_raw_video_mse_camera{cam_idx}"] = np.asarray(matched_mse_by_cam[cam_idx], dtype=np.float32)
+                extra_meta[f"matched_raw_video_start_frame_camera{cam_idx}"] = np.asarray(matched_start_by_cam[cam_idx], dtype=np.int64)
 
         _copy_filtered_episodes(
             src_rb=rb,

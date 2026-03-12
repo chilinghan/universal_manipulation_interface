@@ -1,90 +1,98 @@
 # Dataset Preparation Pipeline
 
-This guide describes the steps to convert raw demonstration videos into a **LeRobot v3 dataset**.
+This pipeline aligns raw videos to processed zarr frames, then transcodes aligned source segments, then converts to LeRobot v3.
 
-Pipeline overview:
+## 1. Match Raw Videos to Zarr Frames
 
-1. **Transcode videos** (crop + resize)
-2. **Match raw videos to Zarr frames**
-3. **Convert dataset to LeRobot v3 format**
+This step matches each zarr episode/camera to the best raw video segment by MSE, while accounting for frame-window offsets produced by `scripts_slam_pipeline/06_generate_dataset_plan.py`.
 
----
-# 1. Transcode Videos
+Outputs:
+- matched zarr containing filtered episodes
+- per-camera metadata:
+  - `matched_raw_video_paths_camera{idx}`
+  - `matched_raw_video_start_frame_camera{idx}`
+  - `matched_raw_video_n_frames_camera{idx}`
+  - `matched_raw_video_mse_camera{idx}`
 
-Transcode raw videos to square 1920×1920 resolution.
+```bash
+python scripts/match_raw_videos_to_zarr.py \
+  --zarr <processed_dataset.zarr.zip> \
+  --raw-video-dir <raw_video_root_dir> \
+  --video-glob "**/*.mp4" \
+  --output <matched_dataset.zarr.zip> \
+  --debug-dir <optional_debug_dir>
+```
 
-Transformation:
+Notes:
+- Use `--video-glob` to choose which files under `--raw-video-dir` are considered.
+- Use `--no-mirror` / `--mirror-swap` if your UMI preprocessing requires it.
 
-- Input assumed **2704×2028**
-- **Center crop → 2028×2028**
-- **Resize → 1920×1920**
-- Decode using **`hevc_cuvid`**
-- Encode using **`av1_nvenc`**
+## 2. Transcode Matched Segments
 
-## Example Demo Session
+This step reads trim ranges from the matched zarr metadata and transcodes only matched segments.
+
+Filter order per output clip:
+1. trim to matched `[start_frame, start_frame + n_frames)`
+2. center crop
+3. resize
+
+```bash
+python scripts/transcode_videos.py \
+  --input-dir <raw_video_root_dir> \
+  --video-glob "**/*.mp4" \
+  --match-zarr <matched_dataset.zarr.zip> \
+  --output-dir <transcoded_video_root_dir> \
+  --crop-size 2028 2028 \
+  --resize-size 1920 1920 \
+  --num-workers 8
+```
+
+Notes:
+- Paths are matched by absolute normalized path, so keep raw videos in the same location between step 1 and step 2.
+- `tag_detection.pkl` is trimmed and corner coordinates are transformed with the same crop+resize parameters.
+
+## 3. Convert to LeRobot v3
+
+```bash
+python scripts/reorganize_zarr_for_lerobot_v3.py \
+  --input <matched_dataset.zarr.zip> \
+  --output-dir <lerobot_output_dir> \
+  --repo-id <repo_id> \
+  --video-mode symlink \
+  --overwrite
+```
+
+## Requirements
+
+Install required packages in the same Python environment used to run the scripts.
+
+```bash
+pip install zarr pyarrow
+```
+
+## Example Commands
+
+### example_demo_session
 
 ```bash
 python run_slam_pipeline.py example_demo_session
-python scripts/transcode_videos.py \
-  --input-dir ./example_demo_session/raw_videos \
-  --output-dir ./example_demo_session/raw_videos_transcoded \
-  --glob "**/*.mp4" \
-  --num-workers 8
-```
 
-## Cup in the Wild Dataset
-
-```bash
-python scripts/transcode_videos.py \
-  --input-dir data/cup_in_the_wild_mp4s \
-  --output-dir data/cup_in_the_wild_mp4s_transcoded \
-  --glob '**/*.mp4' \
-  --resize-size (1080, 1080) \
-  --num-workers 8
-```
-
----
-
-# 2. Match Zarr Frames to Raw Videos
-
-This step aligns frames from the Zarr dataset with frames from the transcoded videos.
-
-Parameters:
-
-* **`--mse-threshold`**
-  Maximum pixel MSE allowed for frame matching.
-
-* **`--frame-count-tolerance`**
-  Allowed mismatch in frame counts.
-
-## Example Demo Session
-
-```bash
 python scripts/match_raw_videos_to_zarr.py \
   --zarr ./example_demo_session/dataset.zarr.zip \
-  --raw-video-dir ./example_demo_session/raw_videos_transcoded/ \
-  --output ./example_demo_session/matched_data.zarr.zip
-```
+  --raw-video-dir ./example_demo_session/raw_videos \
+  --video-glob "*.mp4" \
+  --output ./example_demo_session/matched_data.zarr.zip \
+  --debug-dir ./example_demo_session/debug
 
-## Cup in the Wild Dataset
+python scripts/transcode_videos.py \
+  --input-dir ./example_demo_session/raw_videos \
+  --video-glob "*.mp4" \
+  --match-zarr ./example_demo_session/matched_data.zarr.zip \
+  --output-dir ./example_demo_session/raw_videos_transcoded \
+  --crop-size 2028 2028 \
+  --resize-size 1920 1920 \
+  --num-workers 8
 
-```bash
-python scripts/match_raw_videos_to_zarr.py \
-  --zarr ./data/cup_in_the_wild.zarr.zip \
-  --raw-video-dir ./data/cup_in_the_wild_mp4s_transcoded \
-  --output ./data/cup_in_the_wild_matched_data.zarr.zip \
-  --debug-dir ./data/cup_in_the_wild_debug
-```
-
----
-
-# 3. Convert to LeRobot v3 Dataset
-
-Reorganize the Zarr dataset into **LeRobot v3 format**.
-
-## Example Demo Session
-
-```bash
 python scripts/reorganize_zarr_for_lerobot_v3.py \
   --input ./example_demo_session/matched_data.zarr.zip \
   --output-dir ./example_demo_session/lerobot_v3_dataset \
@@ -93,9 +101,27 @@ python scripts/reorganize_zarr_for_lerobot_v3.py \
   --overwrite
 ```
 
-## Cup in the Wild Dataset
+### cup_in_the_wild_mp4s
+/home/chilingh/projects/universal_manipulation_interface/data/cup_in_the_wild_mp4s/20240110_allen_front_door_facing_shriram
+
 
 ```bash
+python scripts/match_raw_videos_to_zarr.py \
+  --zarr ./data/cup_in_the_wild.zarr.zip \
+  --raw-video-dir ./data/cup_in_the_wild_mp4s \
+  --video-glob "**/*.mp4" \
+  --output ./data/cup_in_the_wild_matched_data.zarr.zip \
+  --debug-dir ./data/cup_in_the_wild_debug
+
+python scripts/transcode_videos.py \
+  --input-dir ./data/cup_in_the_wild_mp4s \
+  --video-glob "**/*.mp4" \
+  --match-zarr ./data/cup_in_the_wild_matched_data.zarr.zip \
+  --output-dir ./data/cup_in_the_wild_mp4s_transcoded \
+  --crop-size 2028 2028 \
+  --resize-size 720 720 \
+  --num-workers 8
+
 python scripts/reorganize_zarr_for_lerobot_v3.py \
   --input ./data/cup_in_the_wild_matched_data.zarr.zip \
   --output-dir ./data/cup_in_the_wild_lerobot_v3_dataset \
@@ -103,26 +129,3 @@ python scripts/reorganize_zarr_for_lerobot_v3.py \
   --video-mode symlink \
   --overwrite
 ```
-
----
-
-# Requirements
-
-`reorganize_zarr_for_lerobot_v3.py` requires both:
-
-* `zarr`
-* `pyarrow`
-
-These must be installed **in the same Python environment**.
-
-Example:
-
-```bash
-pip install zarr pyarrow
-```
-
----
-
-# Final Output
-
-After completing all steps, the dataset will be organized as a **LeRobot v3-compatible dataset** ready for training or uploading.

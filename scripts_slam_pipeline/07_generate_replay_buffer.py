@@ -23,7 +23,7 @@ from umi.common.cv_util import (
     parse_fisheye_intrinsics,
     FisheyeRectConverter
 )
-from umi.common.video_preprocess import make_umi_image_processor
+from universal_manipulation_interface.umi.common.raw_video_util import make_umi_image_processor
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs, JpegXl
 register_codecs()

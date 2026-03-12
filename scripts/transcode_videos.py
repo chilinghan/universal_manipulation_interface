@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""GPU transcode videos for LeRobot V3: center-crop to square then resize.
-
-Default transform:
-- input assumed 2704x2028
-- center crop to 2028x2028
-- resize to 1920x1920 with lanczos
-- decode with hevc_cuvid
-- encode with av1_nvenc
-"""
+"""Transcode matched videos: trim -> center crop -> resize."""
 
 import sys
 import os
@@ -17,21 +9,88 @@ sys.path.append(ROOT_DIR)
 os.chdir(ROOT_DIR)
 
 import pathlib
-import subprocess
-import shutil
 import pickle
-import math
+import re
+import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
-import av
+import click
 import numpy as np
+import zarr
 from tqdm import tqdm
 
-import click
-from exiftool import ExifToolHelper
+from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs
+from diffusion_policy.common.replay_buffer import ReplayBuffer
+from umi.common.raw_video_util import normalize_video_path, resolve_video_paths, safe_relative_path
 
-from umi.common.timecode_util import mp4_get_start_datetime
+register_codecs()
+
+MATCHED_PATHS_RE = re.compile(r"^matched_raw_video_paths_camera(\d+)$")
+
+
+def _open_replay_buffer(zarr_path: pathlib.Path, mode: str):
+    if zarr_path.suffix == ".zip":
+        store = zarr.ZipStore(str(zarr_path), mode=mode)
+        root = zarr.group(store=store)
+        return store, ReplayBuffer.create_from_group(root)
+    root = zarr.open(str(zarr_path), mode=mode)
+    return None, ReplayBuffer.create_from_group(root)
+
+
+def _load_trim_ranges_from_matched_zarr(match_zarr: pathlib.Path) -> Dict[str, Tuple[int, int]]:
+    store, rb = _open_replay_buffer(match_zarr, mode="r")
+    try:
+        trim_by_path: Dict[str, Tuple[int, int]] = {}
+
+        cameras = []
+        for key in rb.meta.keys():
+            m = MATCHED_PATHS_RE.match(key)
+            if m:
+                cameras.append(int(m.group(1)))
+        cameras = sorted(cameras)
+        if not cameras:
+            raise click.ClickException("No matched_raw_video_paths_camera* keys found in --match-zarr metadata.")
+
+        conflicts = []
+        for cam_idx in cameras:
+            path_key = f"matched_raw_video_paths_camera{cam_idx}"
+            start_key = f"matched_raw_video_start_frame_camera{cam_idx}"
+            n_key = f"matched_raw_video_n_frames_camera{cam_idx}"
+
+            if start_key not in rb.meta or n_key not in rb.meta:
+                raise click.ClickException(f"Missing {start_key} or {n_key} in --match-zarr metadata.")
+
+            paths = rb.meta[path_key][:].tolist()
+            starts = np.asarray(rb.meta[start_key][:], dtype=np.int64)
+            n_frames = np.asarray(rb.meta[n_key][:], dtype=np.int64)
+            if len(paths) != len(starts) or len(paths) != len(n_frames):
+                raise click.ClickException(
+                    f"Metadata length mismatch for camera {cam_idx}: "
+                    f"paths={len(paths)}, starts={len(starts)}, n_frames={len(n_frames)}"
+                )
+
+            for raw_path, start, n in zip(paths, starts, n_frames):
+                norm_path = normalize_video_path(raw_path)
+                trim = (int(start), int(n))
+                prev = trim_by_path.get(norm_path)
+                if prev is None:
+                    trim_by_path[norm_path] = trim
+                elif prev != trim:
+                    conflicts.append((norm_path, prev, trim))
+
+        if conflicts:
+            msg = "; ".join([f"{p}: {a} vs {b}" for p, a, b in conflicts[:5]])
+            raise click.ClickException(
+                "Conflicting trim ranges found for the same raw path in --match-zarr metadata. "
+                f"Examples: {msg}"
+            )
+
+        return trim_by_path
+    finally:
+        if store is not None:
+            store.close()
 
 
 def _build_vf(crop_size: tuple, resize_size: tuple, start_frame: int = 0, n_frames: Optional[int] = None) -> str:
@@ -42,6 +101,8 @@ def _build_vf(crop_size: tuple, resize_size: tuple, start_frame: int = 0, n_fram
             trim_parts.append(f"end_frame={start_frame + n_frames}")
         filters.append(f"trim={':'.join(trim_parts)}")
         filters.append("setpts=PTS-STARTPTS")
+
+    # Pipeline order: center-crop first, then resize.
     filters.append(f"crop={crop_size[0]}:{crop_size[1]}:(iw-{crop_size[0]})/2:(ih-{crop_size[1]})/2")
     filters.append(f"scale={resize_size[0]}:{resize_size[1]}:flags=lanczos")
     return ",".join(filters)
@@ -56,7 +117,7 @@ def build_ffmpeg_cmd_gpu(
     n_frames: Optional[int] = None,
 ) -> List[str]:
     vf = _build_vf(crop_size=crop_size, resize_size=resize_size, start_frame=start_frame, n_frames=n_frames)
-    cmd = [
+    return [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
@@ -83,7 +144,6 @@ def build_ffmpeg_cmd_gpu(
         "-an",
         str(out),
     ]
-    return cmd
 
 
 def build_ffmpeg_cmd_cpu(
@@ -95,7 +155,7 @@ def build_ffmpeg_cmd_cpu(
     n_frames: Optional[int] = None,
 ) -> List[str]:
     vf = _build_vf(crop_size=crop_size, resize_size=resize_size, start_frame=start_frame, n_frames=n_frames)
-    cmd = [
+    return [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
@@ -116,7 +176,6 @@ def build_ffmpeg_cmd_cpu(
         "-an",
         str(out),
     ]
-    return cmd
 
 
 def _transform_corners(corners: np.ndarray, in_w: int, in_h: int, crop_size: tuple, resize_size: tuple) -> Optional[np.ndarray]:
@@ -143,17 +202,15 @@ def _rescale_tag_detection_pkl(
     in_h: int,
     crop_size: tuple,
     resize_size: tuple,
-    start_frame: int = 0,
-    n_frames: Optional[int] = None,
+    start_frame: int,
+    n_frames: int,
 ):
     dets = pickle.load(src_pkl.open("rb"))
     if not isinstance(dets, list):
-        # Keep original structure for unexpected formats.
         shutil.copy2(src_pkl, dst_pkl)
         return
 
-    end_frame = None if n_frames is None else (start_frame + n_frames)
-    dets = dets[start_frame:end_frame]
+    dets = dets[start_frame : start_frame + n_frames]
 
     out_dets = []
     for frame in dets:
@@ -186,159 +243,68 @@ def _rescale_tag_detection_pkl(
         pickle.dump(out_dets, f)
 
 
-def _collect_alignment_windows(videos: List[pathlib.Path]) -> Dict[pathlib.Path, Tuple[int, int]]:
-    demo_videos = [p for p in videos if p.suffix.lower() == ".mp4"]
-    if not demo_videos:
-        return {}
-
-    rows = []
-    with ExifToolHelper() as et:
-        for mp4_path in demo_videos:
-            meta = list(et.get_metadata(str(mp4_path)))[0]
-            cam_serial = meta["QuickTime:CameraSerialNumber"]
-            start_date = mp4_get_start_datetime(str(mp4_path))
-            start_timestamp = start_date.timestamp()
-            with av.open(str(mp4_path), "r") as container:
-                stream = container.streams.video[0]
-                n_frames = int(stream.frames)
-                fps = stream.average_rate
-            duration_sec = float(n_frames / fps)
-            rows.append(
-                {
-                    "path": mp4_path,
-                    "camera_serial": cam_serial,
-                    "start_timestamp": start_timestamp,
-                    "end_timestamp": start_timestamp + duration_sec,
-                    "fps": fps,
-                }
-            )
-
-    if not rows:
-        return {}
-
-    video_meta = rows
-    serials = sorted({row["camera_serial"] for row in video_meta})
-    n_cameras = len(serials)
-    events = []
-    for idx, row in enumerate(video_meta):
-        events.append({"vid_idx": idx, "camera_serial": row["camera_serial"], "t": row["start_timestamp"], "is_start": True})
-        events.append({"vid_idx": idx, "camera_serial": row["camera_serial"], "t": row["end_timestamp"], "is_start": False})
-    events.sort(key=lambda x: x["t"])
-
-    demo_groups = []
-    on_videos = set()
-    on_cameras = set()
-    t_demo_start = None
-    for event in events:
-        if event["is_start"]:
-            on_videos.add(event["vid_idx"])
-            on_cameras.add(event["camera_serial"])
-        else:
-            on_videos.remove(event["vid_idx"])
-            on_cameras.remove(event["camera_serial"])
-
-        if len(on_cameras) == n_cameras:
-            t_demo_start = event["t"]
-        elif t_demo_start is not None:
-            demo_groups.append(
-                {
-                    "video_idxs": sorted(on_videos | {event["vid_idx"]}),
-                    "start_timestamp": t_demo_start,
-                    "end_timestamp": event["t"],
-                }
-            )
-            t_demo_start = None
-
-    frame_windows: Dict[pathlib.Path, Tuple[int, int]] = {}
-    for group in demo_groups:
-        selected = [video_meta[i] for i in group["video_idxs"]]
-        selected.sort(key=lambda row: row["camera_serial"])
-        dt = None
-        alignment_costs = []
-        for row in selected:
-            dt = 1 / row["fps"]
-            this_alignment_cost = []
-            for other_row in selected:
-                diff = other_row["start_timestamp"] - row["start_timestamp"]
-                this_alignment_cost.append(diff % dt)
-            alignment_costs.append(this_alignment_cost)
-        align_cam_idx = int(np.argmin([sum(x) for x in alignment_costs]))
-
-        start_timestamp = group["start_timestamp"]
-        end_timestamp = group["end_timestamp"]
-        align_video_start = selected[align_cam_idx]["start_timestamp"]
-        start_timestamp += dt - ((start_timestamp - align_video_start) % dt)
-
-        n_frames = int((end_timestamp - start_timestamp) / dt)
-        cam_start_frame_idxs = []
-        for row in selected:
-            video_start_frame = math.ceil((start_timestamp - row["start_timestamp"]) / dt)
-            video_n_frames = math.floor((row["end_timestamp"] - start_timestamp) / dt) - 1
-            if video_start_frame < 0:
-                video_n_frames += video_start_frame
-                video_start_frame = 0
-            cam_start_frame_idxs.append(video_start_frame)
-            n_frames = min(n_frames, video_n_frames)
-
-        if n_frames <= 0:
-            continue
-
-        for row, start_frame in zip(selected, cam_start_frame_idxs):
-            frame_windows[row["path"]] = (int(start_frame), int(n_frames))
-
-    return frame_windows
-
-
 @click.command()
-@click.option("--input-dir", required=True, type=str)
-@click.option("--output-dir", required=True, type=str)
-@click.option("--glob", "glob_pattern", default="**/*.mp4", show_default=True)
+@click.option("--input-dir", required=True, type=str, help="Root directory containing raw videos.")
+@click.option("--output-dir", required=True, type=str, help="Directory to write transcoded videos.")
+@click.option("--match-zarr", required=True, type=str, help="Matched zarr with matched_raw_video_* metadata.")
+@click.option("--video-glob", default="**/*.mp4", show_default=True, type=str, help="Glob pattern under --input-dir.")
 @click.option("--num-workers", default=8, show_default=True, type=int)
 @click.option("--crop-size", default=(2028, 2028), show_default=True, type=(int, int))
 @click.option("--resize-size", default=(1920, 1920), show_default=True, type=(int, int))
 @click.option("--cpu-only", is_flag=True, default=False, help="Use software transcoding (libx264) only")
-def main(input_dir: str, output_dir: str, glob_pattern: str, num_workers: int, crop_size: tuple, resize_size: tuple, cpu_only: bool):
-    in_dir = pathlib.Path(os.path.expanduser(input_dir)).absolute()
+def main(
+    input_dir: str,
+    output_dir: str,
+    match_zarr: str,
+    video_glob: str,
+    num_workers: int,
+    crop_size: tuple,
+    resize_size: tuple,
+    cpu_only: bool,
+):
     out_dir = pathlib.Path(os.path.expanduser(output_dir)).absolute()
     out_dir.mkdir(parents=True, exist_ok=True)
     if any(out_dir.iterdir()):
         click.confirm(f"Output directory {out_dir} is not empty. Overwrite existing outputs?", abort=True)
 
-    glob_patterns = [glob_pattern]
-    if ".mp4" in glob_pattern:
-        glob_patterns.append(glob_pattern.replace(".mp4", ".MP4"))
-    videos = []
-    seen = set()
-    for pat in glob_patterns:
-        for p in in_dir.glob(pat):
-            if p.is_file() and p not in seen:
-                videos.append(p)
-                seen.add(p)
-    videos = sorted(videos)
-    if not videos:
-        raise click.ClickException(f"No videos found in {in_dir} with pattern {glob_pattern}")
+    try:
+        videos, input_root = resolve_video_paths(input_dir, glob_pattern=video_glob)
+    except FileNotFoundError as exc:
+        raise click.ClickException(str(exc))
 
-    frame_windows = _collect_alignment_windows(videos)
-    if frame_windows:
-        print(f"Applying aligned frame windows to {len(frame_windows)} demo videos")
+    match_zarr_path = pathlib.Path(os.path.expanduser(match_zarr)).absolute()
+    trim_by_path = _load_trim_ranges_from_matched_zarr(match_zarr_path)
+    print(f"Loaded trim metadata from {match_zarr_path}")
+    print(f"Trim ranges for {len(trim_by_path)} raw videos")
 
     jobs = []
     tag_pkl_jobs = []
+    skipped_unmatched = 0
+
     for inp in videos:
-        rel = inp.relative_to(in_dir)
-        out = out_dir / rel
-        out = out.with_suffix(".mp4")
+        trim = trim_by_path.get(normalize_video_path(inp))
+        if trim is None:
+            skipped_unmatched += 1
+            continue
+
+        start_frame, n_frames = trim
+        rel = safe_relative_path(inp, input_root)
+        out = (out_dir / rel).with_suffix(".mp4")
         out.parent.mkdir(parents=True, exist_ok=True)
-        start_frame, n_frames = frame_windows.get(inp, (0, None))
         jobs.append((inp, out, start_frame, n_frames))
+
         src_pkl = inp.parent / "tag_detection.pkl"
         dst_pkl = out.parent / "tag_detection.pkl"
         if src_pkl.is_file():
             tag_pkl_jobs.append((src_pkl, dst_pkl, inp, start_frame, n_frames))
 
+    print(f"Resolved {len(videos)} videos from {input_dir}")
+    print(f"Skipped {skipped_unmatched} videos without match metadata")
     print(f"Transcoding {len(jobs)} videos with {num_workers} workers")
+    if not jobs:
+        raise click.ClickException("No transcode jobs were created.")
 
-    def run_one(inp: pathlib.Path, out: pathlib.Path, start_frame: int, n_frames: Optional[int]):
+    def run_one(inp: pathlib.Path, out: pathlib.Path, start_frame: int, n_frames: int):
         if not cpu_only:
             gpu_cmd = build_ffmpeg_cmd_gpu(inp, out, crop_size, resize_size, start_frame=start_frame, n_frames=n_frames)
             proc = subprocess.run(gpu_cmd, capture_output=True, text=True)
@@ -352,6 +318,7 @@ def main(input_dir: str, output_dir: str, glob_pattern: str, num_workers: int, c
         proc = subprocess.run(cpu_cmd, capture_output=True, text=True)
         if proc.returncode == 0:
             return inp, out, 0, gpu_err
+
         err = proc.stderr.strip()
         if gpu_err:
             err = f"GPU attempt failed:\n{gpu_err}\nCPU fallback failed:\n{err}"
@@ -360,6 +327,7 @@ def main(input_dir: str, output_dir: str, glob_pattern: str, num_workers: int, c
     n_ok = 0
     failures = []
     successful_inputs = set()
+
     with ThreadPoolExecutor(max_workers=num_workers) as ex:
         futs = [ex.submit(run_one, inp, out, start_frame, n_frames) for inp, out, start_frame, n_frames in jobs]
         with tqdm(total=len(futs), desc="Transcoding videos") as pbar:
@@ -373,10 +341,12 @@ def main(input_dir: str, output_dir: str, glob_pattern: str, num_workers: int, c
                 pbar.update(1)
 
     print(f"Done: {n_ok}/{len(jobs)} succeeded")
+
     rescaled_pkls = 0
-    for src_pkl, dst_pkl, inp, start_frame, n_frames in tqdm(tag_pkl_jobs, desc="Rescaling tag detection pkl files"):
+    for src_pkl, dst_pkl, inp, start_frame, n_frames in tqdm(tag_pkl_jobs, desc="Rescaling tag_detection.pkl"):
         if str(inp) not in successful_inputs:
             continue
+
         probe_cmd = [
             "ffprobe",
             "-v",
@@ -392,10 +362,12 @@ def main(input_dir: str, output_dir: str, glob_pattern: str, num_workers: int, c
         probe = subprocess.run(probe_cmd, capture_output=True, text=True)
         if probe.returncode != 0:
             raise click.ClickException(f"ffprobe failed for {inp}: {probe.stderr.strip()}")
+
         wh = probe.stdout.strip().split("x")
         if len(wh) != 2:
             raise click.ClickException(f"Unexpected ffprobe size output for {inp}: {probe.stdout.strip()}")
         in_w, in_h = int(wh[0]), int(wh[1])
+
         _rescale_tag_detection_pkl(
             src_pkl,
             dst_pkl,
@@ -407,6 +379,7 @@ def main(input_dir: str, output_dir: str, glob_pattern: str, num_workers: int, c
             n_frames=n_frames,
         )
         rescaled_pkls += 1
+
     print(f"Wrote transformed tag_detection.pkl files: {rescaled_pkls}")
 
     if failures:
@@ -419,6 +392,6 @@ def main(input_dir: str, output_dir: str, glob_pattern: str, num_workers: int, c
 
 if __name__ == "__main__":
     try:
-        main()        
+        main()
     finally:
         os.system("stty sane")
