@@ -98,7 +98,8 @@ python scripts/reorganize_zarr_for_lerobot_v3.py \
   --output-dir ./example_demo_session/lerobot_v3_dataset \
   --repo-id local/example_demo_session \
   --video-mode symlink \
-  --overwrite
+  --overwrite \
+  --chunks-size 2
 ```
 
 ### cup_in_the_wild_mp4s
